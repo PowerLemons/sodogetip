@@ -1,3 +1,4 @@
+import time
 import datetime
 import traceback
 
@@ -11,6 +12,7 @@ import lang
 import re
 import user_function
 import utils
+import dogetipper
 
 
 def register_user(rpc, msg):
@@ -23,6 +25,10 @@ def register_user(rpc, msg):
             user_function.add_user(msg.author.name, address)
 
             user_function.add_to_history(msg.author.name, "", "", "", "register")
+
+            # create a backup of wallet
+            rpc.backupwallet(
+                config.backup_wallet_path + "backup_" + datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S') + ".dat")
         else:
             bot_logger.logger.warning('Error during register !')
     else:
@@ -85,43 +91,44 @@ def info_user(rpc, msg):
 
 def help_user(rpc, msg):
     if user_function.user_exist(msg.author.name):
-        balance = crypto.get_user_confirmed_balance(rpc, msg.author.name)
         address = user_function.get_user_address(msg.author.name)
-        msg.reply(Template(lang.message_help + lang.message_account_details + lang.message_footer).render(
-            username=msg.author.name, address=address,
-            balance=str(
-                balance)))
+        msg.reply(Template(lang.message_help + lang.message_footer).render(
+            username=msg.author.name, address=address))
     else:
         msg.reply(Template(lang.message_need_register + lang.message_footer).render(username=msg.author.name))
 
 
-def withdraw_user(rpc, msg):
+def withdraw_user(rpc, msg, failover_time):
     split_message = msg.body.strip().split()
 
     if user_function.user_exist(msg.author.name):
         sender_address = user_function.get_user_address(msg.author.name)
-        amount = split_message[1]
+        amount = float(split_message[1])
+        amount = round(amount-0.5)
+        print(amount)
         user_balance = crypto.get_user_confirmed_balance(rpc, msg.author.name)
         user_spendable_balance = crypto.get_user_spendable_balance(rpc, msg.author.name)
         if utils.check_amount_valid(amount) and split_message[4] != sender_address:
-            if int(amount) >= user_balance + user_spendable_balance:
+            if amount >= float(user_balance) + float(user_spendable_balance):
                 bot_logger.logger.info('user %s not have enough to withdraw this amount (%s), balance = %s' % (
                     msg.author.name, amount, user_balance))
-                msg.reply(lang.message_balance_low_withdraw.render(
+                msg.reply(Template(lang.message_balance_low_withdraw).render(
                     username=msg.author.name, user_balance=str(user_balance), amount=str(amount)) + lang.message_footer)
             else:
                 receiver_address = split_message[4]
-                try:
-                    if crypto.send_to(rpc, sender_address, receiver_address, amount):
-                        user_function.add_to_history(msg.author.name, sender_address, receiver_address, amount,
-                                                     "withdraw")
-                        value_usd = utils.get_coin_value(amount)
-                        msg.reply(Template(lang.message_withdraw + lang.message_footer).render(
-                            username=msg.author.name, receiver_address=receiver_address, amount=str(amount),
-                            value_usd=str(value_usd)))
+                if time.time() > int(failover_time.value) + 86400:
+                    send = crypto.send_to(rpc, sender_address, receiver_address, amount)
+                else:
+                    send = crypto.send_to_failover(rpc, sender_address, receiver_address, amount)
 
-                except:
-                    traceback.print_exc()
+                if send:
+                    user_function.add_to_history(msg.author.name, sender_address, receiver_address, amount,
+                                                 "withdraw")
+                    value_usd = utils.get_coin_value(amount)
+                    msg.reply(Template(lang.message_withdraw + lang.message_footer).render(
+                        username=msg.author.name, receiver_address=receiver_address, amount=str(amount),
+                        value_usd=str(value_usd)))
+
         elif split_message[4] == sender_address:
             msg.reply(lang.message_withdraw_to_self + lang.message_footer)
         else:
@@ -131,16 +138,17 @@ def withdraw_user(rpc, msg):
         msg.reply(Template(lang.message_need_register + lang.message_footer).render(username=msg.author.name))
 
 
-def tip_user(rpc, reddit, msg):
+def tip_user(rpc, reddit, msg, tx_queue, failover_time):
     bot_logger.logger.info('An user mention detected ')
+    bot_logger.logger.debug("failover_time : %s " % (str(failover_time.value)))
+
     split_message = msg.body.lower().strip().split()
     tip_index = split_message.index(str('+/u/' + config.bot_name))
 
     if split_message[tip_index] == str('+/u/' + config.bot_name) and split_message[tip_index + 2] == 'doge':
 
-        amount = split_message[tip_index + 1]
-        value_usd = utils.get_coin_value(amount)
-
+        amount = float(split_message[tip_index + 1])
+        amount = round(amount-0.5)
         if utils.check_amount_valid(amount):
             parent_comment = msg.parent()
             if user_function.user_exist(msg.author.name) and (msg.author.name != parent_comment.author.name):
@@ -148,35 +156,42 @@ def tip_user(rpc, reddit, msg):
                 # check we have enough
                 user_balance = crypto.get_user_confirmed_balance(rpc, msg.author.name)
                 user_pending_balance = crypto.get_user_unconfirmed_balance(rpc, msg.author.name)
-                user_spendable_balance = crypto.get_user_spendable_balance(rpc, msg.author.name) + user_balance
-                if int(amount) >= user_spendable_balance:
+
+                user_spendable_balance = crypto.balance_user(rpc, msg, failover_time)
+                bot_logger.logger.debug('user_spendable_balance = %s' % user_spendable_balance)
+
+                # in failover we need to use only user_balance
+                if amount >= float(user_spendable_balance):
                     # not enough for tip
-                    if int(amount) < (user_spendable_balance + user_pending_balance):
-                        msg.reply(Template(lang.message_balance_pending_tip).render(username=msg.author.name))
+                    if amount < float(user_pending_balance):
+                        reddit.redditor(msg.author.name).message('pending tip', Template(lang.message_balance_pending_tip).render(username=msg.author.name))
                     else:
                         bot_logger.logger.info('user %s not have enough to tip this amount (%s), balance = %s' % (
                             msg.author.name, str(amount), str(user_balance)))
-                        msg.reply(Template(lang.message_balance_low_tip).render(username=msg.author.name))
+                        reddit.redditor(msg.author.name).message('low balance', Template(lang.message_balance_low_tip).render(username=msg.author.name))
                 else:
+
+                    value_usd = utils.get_coin_value(amount)
 
                     # check user have address before tip
                     if user_function.user_exist(parent_comment.author.name):
-                        txid = crypto.tip_user(rpc, msg.author.name, parent_comment.author.name, amount)
+                        txid = crypto.tip_user(rpc, msg.author.name, parent_comment.author.name, amount, tx_queue,
+                                               failover_time)
                         if txid:
                             user_function.add_to_history(msg.author.name, msg.author.name, parent_comment.author.name,
                                                          amount,
-                                                         "tip send",txid)
+                                                         "tip send", txid)
                             user_function.add_to_history(parent_comment.author.name, msg.author.name,
                                                          parent_comment.author.name,
                                                          amount,
-                                                         "tip receive",txid)
+                                                         "tip receive", txid)
 
                             bot_logger.logger.info(
                                 '%s tip %s to %s' % (msg.author.name, str(amount), parent_comment.author.name))
                             # if user have 'verify' in this command he will have confirmation
                             if split_message.count('verify') or int(amount) >= 1000:
                                 msg.reply(Template(lang.message_tip).render(
-                                    sender=msg.author.name, receiver=parent_comment.author.name, amount=str(amount),
+                                    sender=msg.author.name, receiver=parent_comment.author.name, amount=str(int(amount)),
                                     value_usd=str(value_usd), txid=txid
                                 ))
                     else:
@@ -190,7 +205,7 @@ def tip_user(rpc, reddit, msg):
                                                      amount,
                                                      "tip receive", False)
                         bot_logger.logger.info('user %s not registered' % parent_comment.author.name)
-                        msg.reply(Template(lang.message_recipient_register).render(username=parent_comment.author.name))
+                        reddit.redditor(msg.author.name).message('tipped user not registered', Template(lang.message_recipient_register).render(username=parent_comment.author.name))
 
                         reddit.redditor(parent_comment.author.name).message(
                             Template(
@@ -200,12 +215,12 @@ def tip_user(rpc, reddit, msg):
                                 username=parent_comment.author.name, sender=msg.author.name, amount=str(amount),
                                 value_usd=str(value_usd)))
             elif user_function.user_exist(msg.author.name) and (msg.author.name == parent_comment.author.name):
-                msg.reply(Template(lang.message_recipient_self).render(username=msg.author.name))
+                reddit.redditor(msg.author.name).message('cannot tip self', Template(lang.message_recipient_self).render(username=msg.author.name))
             else:
-                msg.reply(Template(lang.message_need_register).render(username=msg.author.name))
+                reddit.redditor(msg.author.name).message('tipped user not registered', Template(lang.message_need_register).render(username=msg.author.name))
         else:
             bot_logger.logger.info(lang.message_invalid_amount)
-            msg.reply(lang.message_invalid_amount)
+            reddit.redditor(msg.author.name).message('invalid amount', lang.message_invalid_amount)
 
 
 def history_user(msg):
@@ -230,7 +245,7 @@ def history_user(msg):
 
 
 # Resend tips to previously unregistered users that are now registered
-def replay_remove_pending_tip(rpc, reddit):
+def replay_remove_pending_tip(rpc, reddit, tx_queue, failover_time):
     # check if it's not too old & replay tipping
     limit_date = datetime.datetime.now() - datetime.timedelta(days=3)
 
@@ -245,7 +260,7 @@ def replay_remove_pending_tip(rpc, reddit):
                     bot_logger.logger.info(
                         "replay tipping %s - %s send %s to %s  " % (
                             str(tip['id']), tip['sender'], tip['amount'], tip['receiver']))
-                    txid = crypto.tip_user(rpc, tip['sender'], tip['receiver'], tip['amount'])
+                    txid = crypto.tip_user(rpc, tip['sender'], tip['receiver'], tip['amount'], tx_queue, failover_time)
                     user_function.remove_pending_tip(tip['id'])
 
                     value_usd = utils.get_coin_value(tip['amount'])
